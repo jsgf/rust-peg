@@ -61,14 +61,14 @@ pub enum Expr {
 pub fn compile_grammar(ctxt: &rustast::ExtCtxt, grammar: &Grammar) -> rustast::P<rustast::Mod> {
     let mut imports = grammar.imports.clone();
     imports.push(RustUseList("self::RuleResult".to_string(),
-                             vec!("Matched".to_string(), "Failed".to_string())));
+			     vec!("Matched".to_string(), "Failed".to_string())));
     let mut items = translate_view_items(ctxt, &imports);
 	items.append(&mut header_items(ctxt));
 	items.append(&mut make_parse_state(ctxt, &grammar.rules));
 	items.extend(grammar.rules.iter().map(|rule| {
 		compile_rule(ctxt, grammar, rule)
 	}));
-	items.extend(grammar.rules.iter().filter(|rule| rule.exported).map(|rule| {
+	items.extend(grammar.rules.iter().filter(|rule| rule.exported).flat_map(|rule| {
 		compile_rule_export(ctxt, rule)
 	}));
 
@@ -104,20 +104,22 @@ fn make_parse_state(ctxt: &rustast::ExtCtxt, rules: &[Rule]) -> Vec<rustast::P<r
 	}
 
 	items.push(quote_item!(ctxt,
-		struct ParseState<'input> {
+		struct ParseState<'input, Env=()> {
 			max_err_pos: usize,
 			expected: ::std::collections::HashSet<&'static str>,
+			env: Env,
 			_phantom: ::std::marker::PhantomData<&'input ()>,
 			$cache_fields
 		}
 	).unwrap());
 
 	items.push(quote_item!(ctxt,
-		impl<'input> ParseState<'input> {
-			fn new() -> ParseState<'input> {
+		impl<'input, Env> ParseState<'input, Env> {
+			fn new(env: Env) -> ParseState<'input, Env> {
 				ParseState {
 					max_err_pos: 0,
 					expected: ::std::collections::HashSet::new(),
+					env: env,
 					_phantom: ::std::marker::PhantomData,
 					$cache_init
 				}
@@ -134,6 +136,7 @@ fn make_parse_state(ctxt: &rustast::ExtCtxt, rules: &[Rule]) -> Vec<rustast::P<r
 
 				Failed
 			}
+			pub fn env(&mut self) -> &mut Env { &self.env }
 		}
 	).unwrap());
 
@@ -210,7 +213,7 @@ pub fn header_items(ctxt: &rustast::ExtCtxt) -> Vec<rustast::P<rustast::Item>> {
 	).unwrap());
 
 	items.push(quote_item!(ctxt,
-		fn slice_eq(input: &str, state: &mut ParseState, pos: usize, m: &'static str) -> RuleResult<()> {
+		fn slice_eq<'a, Env>(input: &str, state: &mut ParseState<'a, Env>, pos: usize, m: &'static str) -> RuleResult<()> {
 			#![inline]
 			#![allow(dead_code)]
 
@@ -224,7 +227,7 @@ pub fn header_items(ctxt: &rustast::ExtCtxt) -> Vec<rustast::P<rustast::Item>> {
 	).unwrap());
 
 	items.push(quote_item!(ctxt,
-		fn slice_eq_case_insensitive(input: &str, state: &mut ParseState, pos: usize, m: &'static str) -> RuleResult<()> {
+		fn slice_eq_case_insensitive<'a, Env>(input: &str, state: &mut ParseState<'a, Env>, pos: usize, m: &'static str) -> RuleResult<()> {
 			#![inline]
 			#![allow(dead_code)]
 
@@ -306,7 +309,7 @@ fn compile_rule(ctxt: &rustast::ExtCtxt, grammar: &Grammar, rule: &Rule) -> rust
 		let cache_field = rustast::str_to_ident(&format!("{}_cache", rule.name));
 
 		quote_item!(ctxt,
-			fn $name<'input>(input: &'input str, state: &mut ParseState<'input>, pos: usize) -> RuleResult<$ret> {
+			fn $name<'input, Env>(input: &'input str, state: &mut ParseState<'input, Env>, pos: usize) -> RuleResult<$ret> {
 				let rule_result = $wrapped_body;
 				state.$cache_field.insert(pos, rule_result.clone());
 
@@ -315,38 +318,48 @@ fn compile_rule(ctxt: &rustast::ExtCtxt, grammar: &Grammar, rule: &Rule) -> rust
 		).unwrap()
 	} else {
 		quote_item!(ctxt,
-			fn $name<'input>(input: &'input str, state: &mut ParseState<'input>, pos: usize) -> RuleResult<$ret> {
+			fn $name<'input, Env>(input: &'input str, state: &mut ParseState<'input, Env>, pos: usize) -> RuleResult<$ret> {
 				$wrapped_body
 			}
 		).unwrap()
 	}
 }
 
-fn compile_rule_export(ctxt: &rustast::ExtCtxt, rule: &Rule) -> rustast::P<rustast::Item> {
+fn compile_rule_export(ctxt: &rustast::ExtCtxt, rule: &Rule) -> Vec<rustast::P<rustast::Item>> {
 	let name = rustast::str_to_ident(&rule.name);
+	let envname = rustast::str_to_ident(&format!("{}_env", rule.name));
 	let ret = rustast::parse_type(ctxt, &rule.ret_type);
 	let parse_fn = rustast::str_to_ident(&format!("parse_{}", rule.name));
-	(quote_item!(ctxt,
-		pub fn $name<'input>(input: &'input str) -> ParseResult<$ret> {
-			let mut state = ParseState::new();
+	let mut ivec = Vec::new();
+
+	ivec.push(quote_item!(ctxt,
+		pub fn $envname<'input, Env>(input: &'input str, env: Env) -> (ParseResult<$ret>, Env) {
+			let mut state = ParseState::new(env);
 			match $parse_fn(input, &mut state, 0) {
 				Matched(pos, value) => {
 					if pos == input.len() {
-						return Ok(value)
+						return (Ok(value), state.env)
 					}
 				}
 				_ => {}
 			}
 			let (line, col) = pos_to_line(input, state.max_err_pos);
 
-			Err(ParseError {
+			(Err(ParseError {
 				line: line,
 				column: col,
 				offset: state.max_err_pos,
 				expected: state.expected,
-			})
+			}), state.env)
 		}
-	)).unwrap()
+	).unwrap());
+	ivec.push(quote_item!(ctxt,
+		pub fn $name<'input>(input: &'input str) -> ParseResult<$ret> {
+		    $envname(input, ()).0
+		}
+	).unwrap());
+
+	ivec
 }
 
 fn compile_match_and_then(ctxt: &rustast::ExtCtxt, grammar: &Grammar, e: &Expr, value_name: Option<&str>, then: rustast::P<rustast::Expr>) -> rustast::P<rustast::Expr> {
@@ -667,8 +680,8 @@ fn compile_expr(ctxt: &rustast::ExtCtxt, grammar: &Grammar, e: &Expr, result_use
 fn test_format_char_set() {
     assert_eq!(format_char_set(false,
                                &[CharSetCase{start: 'a', end: 'z'},
-                                 CharSetCase{start: '0', end: '9'}]),
+	                         CharSetCase{start: '0', end: '9'}]),
                "[a-z0-9]");
     assert_eq!(format_char_set(true, &[CharSetCase{start: 'A', end: 'Z'}]),
-               "[^A-Z]");
+	       "[^A-Z]");
 }
